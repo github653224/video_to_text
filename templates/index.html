@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>视频转文字工具 - AI 智能转录</title>
+    <meta name="description" content="基于 AI 的视频转文字工具，支持多种视频格式，自动提取音频并转换为文字">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.8.1/font/bootstrap-icons.css">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="main-wrapper">
+        <!-- 导航栏 -->
+        <nav class="navbar navbar-expand-lg navbar-dark bg-transparent">
+            <div class="container">
+                <a class="navbar-brand d-flex align-items-center" href="/">
+                    <i class="bi bi-camera-video-fill me-2" style="font-size: 1.5rem;"></i>
+                    <span class="fw-bold">视频转文字</span>
+                </a>
+                <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                    <span class="navbar-toggler-icon"></span>
+                </button>
+                <div class="collapse navbar-collapse" id="navbarNav">
+                    <ul class="navbar-nav ms-auto">
+                        <li class="nav-item">
+                            <a class="nav-link" href="#tasks">
+                                <i class="bi bi-list-task"></i> 任务列表
+                            </a>
+                        </li>
+                    </ul>
+                </div>
+            </div>
+        </nav>
+
+        <div class="container py-4">
+            <!-- 紧凑的标题区域 -->
+            <div class="header-section text-center mb-4">
+                <h2 class="header-title mb-2">
+                    <i class="bi bi-camera-video-fill"></i> AI 视频转文字
+                </h2>
+                <p class="header-subtitle mb-0">基于 Whisper AI，快速准确地将视频转换为文字</p>
+            </div>
+
+            <!-- 紧凑的上传区域 -->
+            <div class="upload-section mb-4">
+                <div class="card upload-card">
+                    <div class="card-body p-3">
+                        <div class="row g-3 align-items-center">
+                            <div class="col-lg-8">
+                                <div id="uploadArea" class="upload-area-compact">
+                                    <div class="d-flex align-items-center">
+                                        <div class="upload-icon-compact me-3">
+                                            <i class="bi bi-cloud-arrow-up"></i>
+                                        </div>
+                                        <div class="flex-grow-1">
+                                            <h6 class="mb-1">点击或拖放视频文件</h6>
+                                            <small class="text-muted">支持 MP4, AVI, MOV, MKV | 最大 500MB | 可多选</small>
+                                        </div>
+                                    </div>
+                                </div>
+                                <input type="file" id="videoFile" accept="video/*" class="d-none" multiple>
+                            </div>
+                            <div class="col-lg-4 text-lg-end">
+                                <button id="uploadButton" class="btn btn-primary px-4" disabled>
+                                    <i class="bi bi-upload"></i> 开始转换
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 任务列表 -->
+            <div id="tasks" class="tasks-section">
+                <div class="section-header mb-4">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <h3 class="section-title mb-0">
+                            <i class="bi bi-list-check"></i> 转换任务
+                        </h3>
+                        <button id="refreshButton" class="btn btn-outline-primary">
+                            <i class="bi bi-arrow-clockwise"></i> 刷新
+                        </button>
+                    </div>
+                </div>
+                <div id="taskList" class="row g-3">
+                    <!-- 任务列表会动态加载到这里 -->
+                    <div class="col-12">
+                        <div class="empty-state">
+                            <i class="bi bi-hourglass-split"></i>
+                            <p>正在加载任务列表...</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 页脚 -->
+        <footer class="footer mt-5 py-4">
+            <div class="container text-center">
+                <p class="text-white-50 mb-0">
+                    <i class="bi bi-heart-fill text-danger"></i> 
+                    基于 OpenAI Whisper 构建
+                </p>
+            </div>
+        </footer>
+    </div>
+
+    <!-- 预览模态框 -->
+    <div class="modal fade" id="previewModal" tabindex="-1">
+        <div class="modal-dialog modal-lg modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header border-0">
+                    <h5 class="modal-title fw-bold">
+                        <i class="bi bi-eye"></i> 转换结果预览
+                    </h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="preview-section mb-4">
+                        <h6 class="preview-label">
+                            <i class="bi bi-music-note-beamed"></i> 音频预览
+                        </h6>
+                        <audio id="previewAudio" controls class="audio-player">
+                            您的浏览器不支持音频播放
+                        </audio>
+                    </div>
+                    <div class="preview-section">
+                        <h6 class="preview-label">
+                            <i class="bi bi-file-text"></i> 文字内容
+                        </h6>
+                        <div id="previewText" class="preview-text">
+                            加载中...
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer border-0">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                        关闭
+                    </button>
+                    <a id="downloadAudioBtn" class="btn btn-primary">
+                        <i class="bi bi-download"></i> 下载音频
+                    </a>
+                    <a id="downloadTextBtn" class="btn btn-primary">
+                        <i class="bi bi-download"></i> 下载文字
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="/static/js/script.js"></script>
+</body>
+</html>

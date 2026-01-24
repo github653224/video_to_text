@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+openai-whisper
+moviepy
+sqlalchemy
+aiofiles
+python-multipart
+websockets
+jinja2
+python-decouple
+celery
+redis
