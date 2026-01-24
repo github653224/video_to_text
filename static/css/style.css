@@ -187,6 +187,51 @@ body::before {
     overflow: hidden;
 }
 
+/* 紧凑横条版上传区域 */
+.upload-area-compact {
+    border: 2px dashed #e2e8f0;
+    border-radius: var(--radius-sm);
+    padding: 1rem;
+    cursor: pointer;
+    transition: var(--transition-base);
+    background: #f7fafc;
+}
+
+.upload-area-compact:hover {
+    border-color: var(--primary-color);
+    background: #edf2f7;
+}
+
+.upload-area-compact.dragover {
+    border-color: #48bb78;
+    background: rgba(72, 187, 120, 0.05);
+}
+
+.upload-icon-compact {
+    font-size: 2rem;
+    color: var(--primary-color);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 48px;
+    height: 48px;
+    background: rgba(102, 126, 234, 0.1);
+    border-radius: var(--radius-sm);
+    flex-shrink: 0;
+}
+
+.upload-area-compact h6 {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #2d3748;
+    margin: 0;
+}
+
+.upload-area-compact small {
+    font-size: 0.8rem;
+}
+
+/* 传统大版上传区域（保留但不使用） */
 .upload-area {
     border: 3px dashed #e2e8f0;
     border-radius: var(--radius-md);
