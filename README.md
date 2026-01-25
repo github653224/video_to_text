@@ -1,3 +1,5 @@
+<div align="center">
+
 # 🎬 视频转文字工具 (Video to Text)
 
 基于 OpenAI Whisper 的智能视频转文字工具，支持批量上传、大文件处理和实时进度跟踪。
@@ -5,6 +7,8 @@
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.8+-green.svg)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-00a393.svg)
+
+</div>
 
 ## ✨ 功能特性
 
