@@ -10,6 +10,18 @@
 
 </div>
 
+## 📸 项目截图
+
+<div align="center">
+
+### 主界面
+![主界面](static/images/main.png)
+
+### 转换结果预览
+![预览界面](static/images/preview.png)
+
+</div>
+
 ## ✨ 功能特性
 
 - 🚀 **快速转录**：基于 OpenAI Whisper 模型，准确识别中文语音
