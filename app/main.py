@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, WebSocket, WebSocketDisconnect, Form
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
@@ -6,8 +6,9 @@ import os
 import asyncio
 from pathlib import Path
 import uuid
-from typing import List
+from typing import List, Optional
 import json
+import shutil
 
 from app.database import get_db, init_db
 from app.models import VideoTask
@@ -127,6 +128,74 @@ async def upload_video(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/upload/chunk")
+async def upload_chunk(
+    file: UploadFile = File(...),
+    upload_id: str = Form(...),
+    chunk_index: int = Form(...),
+    total_chunks: int = Form(...),
+    filename: str = Form(...),
+):
+    """接收单个分片"""
+    chunk_dir = UPLOAD_DIR / "chunks" / upload_id
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+
+    chunk_path = chunk_dir / f"{chunk_index:05d}"
+    with open(chunk_path, "wb") as f:
+        while True:
+            data = await file.read(1024 * 1024)
+            if not data:
+                break
+            f.write(data)
+
+    return JSONResponse({"success": True, "chunk_index": chunk_index})
+
+
+@app.post("/upload/merge")
+async def merge_chunks(
+    upload_id: str = Form(...),
+    filename: str = Form(...),
+    total_chunks: int = Form(...),
+    db: Session = Depends(get_db),
+):
+    """合并所有分片并启动转录任务"""
+    chunk_dir = UPLOAD_DIR / "chunks" / upload_id
+
+    video_dir = UPLOAD_DIR / "videos"
+    video_dir.mkdir(exist_ok=True)
+    task_id = str(uuid.uuid4())
+    file_ext = Path(filename).suffix or ".mp4"
+    video_path = video_dir / f"{task_id}{file_ext}"
+
+    try:
+        with open(video_path, "wb") as out:
+            for i in range(total_chunks):
+                chunk_path = chunk_dir / f"{i:05d}"
+                if not chunk_path.exists():
+                    raise HTTPException(status_code=400, detail=f"分片 {i} 缺失")
+                with open(chunk_path, "rb") as inp:
+                    shutil.copyfileobj(inp, out)
+    finally:
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+
+    file_size = video_path.stat().st_size
+    print(f"[Merge] {filename} -> {video_path} ({file_size / (1024*1024):.2f} MB)")
+
+    task = VideoTask(
+        id=task_id,
+        original_filename=filename,
+        video_path=str(video_path),
+        status="pending",
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+
+    asyncio.create_task(process_video_task(task_id))
+
+    return JSONResponse({"success": True, "task_id": task_id, "message": "视频上传成功，开始处理"})
 
 
 def get_websocket_manager():

@@ -138,68 +138,71 @@ function updateUploadAreaWithFiles() {
     `;
 }
 
-// 上传文件
+// 上传文件（分片上传，支持大文件）
 async function uploadFile() {
     if (selectedFiles.length === 0) {
         showAlert('warning', '请先选择文件');
         return;
     }
 
-    // 检查文件类型和大小
     const allowedTypes = ['video/mp4', 'video/avi', 'video/quicktime', 'video/x-matroska', 'video/webm', 'video/x-msvideo'];
-    const maxSize = 500 * 1024 * 1024; // 提升到 500MB
-    
     for (const file of selectedFiles) {
-        // 检查文件类型
         if (!allowedTypes.some(type => file.type === type || file.name.match(/\.(mp4|avi|mov|mkv|webm)$/i))) {
             showAlert('warning', `文件 ${file.name} 格式不支持，请选择视频文件`);
             return;
         }
-        
-        // 检查文件大小
-        if (file.size > maxSize) {
-            showAlert('danger', `文件 ${file.name} 太大，请选择小于 500MB 的文件`);
-            return;
-        }
     }
 
-    // 显示上传状态
     uploadButton.disabled = true;
     const originalButtonText = uploadButton.innerHTML;
-    uploadButton.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 上传中...';
 
     let successCount = 0;
     let failCount = 0;
 
-    // 逐个上传文件
     for (let i = 0; i < selectedFiles.length; i++) {
         const file = selectedFiles[i];
-        const formData = new FormData();
-        formData.append('file', file);
+        const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB per chunk
+        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+        const uploadId = crypto.randomUUID();
 
         try {
-            uploadButton.innerHTML = `<span class="spinner-border spinner-border-sm"></span> 上传中 (${i + 1}/${selectedFiles.length})...`;
-            
-            const response = await fetch('/upload', {
-                method: 'POST',
-                body: formData
-            });
+            // 上传各分片
+            for (let ci = 0; ci < totalChunks; ci++) {
+                const pct = Math.round(((ci + 1) / totalChunks) * 100);
+                uploadButton.innerHTML = `<span class="spinner-border spinner-border-sm"></span> 上传中 (${i + 1}/${selectedFiles.length}) ${pct}%`;
 
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.detail || `上传失败: ${response.status}`);
+                const blob = file.slice(ci * CHUNK_SIZE, (ci + 1) * CHUNK_SIZE);
+                const fd = new FormData();
+                fd.append('file', blob, file.name);
+                fd.append('upload_id', uploadId);
+                fd.append('chunk_index', ci);
+                fd.append('total_chunks', totalChunks);
+                fd.append('filename', file.name);
+
+                const res = await fetch('/upload/chunk', { method: 'POST', body: fd });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    throw new Error(err.detail || `分片 ${ci} 上传失败: ${res.status}`);
+                }
             }
 
-            const result = await response.json();
+            // 合并分片
+            uploadButton.innerHTML = `<span class="spinner-border spinner-border-sm"></span> 合并中 (${i + 1}/${selectedFiles.length})...`;
+            const mfd = new FormData();
+            mfd.append('upload_id', uploadId);
+            mfd.append('filename', file.name);
+            mfd.append('total_chunks', totalChunks);
 
+            const mres = await fetch('/upload/merge', { method: 'POST', body: mfd });
+            if (!mres.ok) {
+                const err = await mres.json().catch(() => ({}));
+                throw new Error(err.detail || `合并失败: ${mres.status}`);
+            }
+
+            const result = await mres.json();
             if (result.success) {
                 successCount++;
-                
-                // 立即连接WebSocket
                 connectWebSocket(result.task_id);
-                
-                // 不在这里添加任务卡片，等待 loadTasks 统一加载
-                // 这样可以避免重复
             } else {
                 throw new Error(result.message || '上传失败');
             }
@@ -211,15 +214,10 @@ async function uploadFile() {
         }
     }
 
-    // 显示结果
     if (successCount > 0) {
         showAlert('success', `成功上传 ${successCount} 个文件${failCount > 0 ? `，${failCount} 个失败` : ''}`);
         resetUploadArea();
-        
-        // 延迟加载任务列表，等待后端创建完成
-        setTimeout(async () => {
-            await loadTasks();
-        }, 500);
+        setTimeout(async () => { await loadTasks(); }, 500);
     }
 
     uploadButton.disabled = false;
@@ -239,7 +237,7 @@ function resetUploadArea() {
                 </div>
                 <div class="flex-grow-1">
                     <h6 class="mb-1">点击或拖放视频文件</h6>
-                    <small class="text-muted">支持 MP4, AVI, MOV, MKV | 最大 500MB | 可多选</small>
+                    <small class="text-muted">支持 MP4, AVI, MOV, MKV | 可多选</small>
                 </div>
             </div>
         `;
