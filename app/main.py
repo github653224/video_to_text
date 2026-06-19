@@ -1,17 +1,28 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, WebSocket, WebSocketDisconnect, Form, Body
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 import os
 import asyncio
+import time
 from pathlib import Path
 import uuid
-from typing import List
+from typing import List, Optional
 import json
+import shutil
 
 from app.database import get_db, init_db
 from app.models import VideoTask
 from app.tasks import TranscriptionTask
+
+
+def _ts() -> str:
+    """返回带毫秒的时间戳，方便排查卡顿。"""
+    return time.strftime("%H:%M:%S", time.localtime()) + f".{int((time.time() % 1) * 1000):03d}"
+
+
+def log(tag: str, msg: str) -> None:
+    print(f"[{_ts()}] [{tag}] {msg}", flush=True)
 
 # 创建FastAPI应用
 app = FastAPI(
@@ -48,11 +59,21 @@ class ConnectionManager:
         await websocket.send_text(message)
 
     async def broadcast(self, message: str):
-        for connection in self.active_connections:
+        if not self.active_connections:
+            return
+        log("WS", f"broadcast to {len(self.active_connections)} connections, msg_len={len(message)}")
+        bt0 = time.time()
+        for connection in list(self.active_connections):
             try:
-                await connection.send_text(message)
-            except:
-                pass
+                # 单个连接最多等 2s，避免某个连接半死状态拖死整个进度广播
+                await asyncio.wait_for(connection.send_text(message), timeout=2.0)
+            except asyncio.TimeoutError:
+                log("WS", "broadcast send timeout, dropping connection")
+                self.disconnect(connection)
+            except Exception as e:
+                log("WS", f"broadcast send failed: {e}")
+                self.disconnect(connection)
+        log("WS", f"broadcast done cost={time.time() - bt0:.2f}s")
 
 
 manager = ConnectionManager()
@@ -129,6 +150,103 @@ async def upload_video(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/upload/chunk")
+async def upload_chunk(
+    file: UploadFile = File(...),
+    upload_id: str = Form(...),
+    chunk_index: int = Form(...),
+    total_chunks: int = Form(...),
+    filename: str = Form(...),
+):
+    """接收单个分片"""
+    t0 = time.time()
+    chunk_dir = UPLOAD_DIR / "chunks" / upload_id
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+
+    chunk_path = chunk_dir / f"{chunk_index:05d}"
+    bytes_written = 0
+    with open(chunk_path, "wb") as f:
+        while True:
+            data = await file.read(1024 * 1024)
+            if not data:
+                break
+            f.write(data)
+            bytes_written += len(data)
+
+    log(
+        "Chunk",
+        f"upload_id={upload_id[:8]} idx={chunk_index + 1}/{total_chunks} "
+        f"size={bytes_written / 1024:.1f}KB cost={time.time() - t0:.2f}s file={filename}",
+    )
+    return JSONResponse({"success": True, "chunk_index": chunk_index})
+
+
+@app.post("/upload/merge")
+async def merge_chunks(
+    upload_id: str = Form(...),
+    filename: str = Form(...),
+    total_chunks: int = Form(...),
+    db: Session = Depends(get_db),
+):
+    """合并所有分片并启动转录任务"""
+    t0 = time.time()
+    chunk_dir = UPLOAD_DIR / "chunks" / upload_id
+
+    video_dir = UPLOAD_DIR / "videos"
+    video_dir.mkdir(exist_ok=True)
+    task_id = str(uuid.uuid4())
+    file_ext = Path(filename).suffix or ".mp4"
+    video_path = video_dir / f"{task_id}{file_ext}"
+
+    log("Merge", f"start upload_id={upload_id[:8]} filename={filename} chunks={total_chunks} -> {video_path.name}")
+
+    try:
+        # 同步 IO 放进线程池，避免阻塞事件循环
+        def _do_merge() -> int:
+            written = 0
+            with open(video_path, "wb") as out:
+                for i in range(total_chunks):
+                    chunk_path = chunk_dir / f"{i:05d}"
+                    if not chunk_path.exists():
+                        raise FileNotFoundError(f"分片 {i} 缺失")
+                    with open(chunk_path, "rb") as inp:
+                        shutil.copyfileobj(inp, out, length=4 * 1024 * 1024)
+                    if (i + 1) % 10 == 0 or (i + 1) == total_chunks:
+                        log("Merge", f"  progress {i + 1}/{total_chunks}")
+                    written = out.tell()
+            return written
+
+        loop = asyncio.get_event_loop()
+        try:
+            total_bytes = await loop.run_in_executor(None, _do_merge)
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+
+    file_size = video_path.stat().st_size
+    log(
+        "Merge",
+        f"done {filename} -> {video_path} "
+        f"({file_size / (1024 * 1024):.2f} MB) cost={time.time() - t0:.2f}s",
+    )
+
+    task = VideoTask(
+        id=task_id,
+        original_filename=filename,
+        video_path=str(video_path),
+        status="pending",
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+
+    log("Merge", f"task created task_id={task_id} status=pending, scheduling background processing")
+    asyncio.create_task(process_video_task(task_id))
+
+    return JSONResponse({"success": True, "task_id": task_id, "message": "视频上传成功，开始处理"})
+
+
 def get_websocket_manager():
     """获取WebSocket管理器"""
     return manager
@@ -138,8 +256,9 @@ async def process_video_task(task_id: str):
     """
     后台处理视频任务 - 支持并发
     """
+    t0 = time.time()
     try:
-        print(f"[Background] Starting task: {task_id}")
+        log("Background", f"task_id={task_id} entering process_video_task")
         task = TranscriptionTask(task_id, get_websocket_manager())
         await task.process()
 
@@ -148,14 +267,14 @@ async def process_video_task(task_id: str):
             "type": "task_completed",
             "task_id": task_id
         }))
-        
-        print(f"[Background] Task completed: {task_id}")
+
+        log("Background", f"task_id={task_id} completed total_cost={time.time() - t0:.2f}s")
 
     except Exception as e:
-        print(f"[Background] Task failed: {task_id}, Error: {e}")
+        log("Background", f"task_id={task_id} FAILED after {time.time() - t0:.2f}s: {e}")
         import traceback
         traceback.print_exc()
-        
+
         await manager.broadcast(json.dumps({
             "type": "task_failed",
             "task_id": task_id,
@@ -175,10 +294,40 @@ async def get_task_status(task_id: str, db: Session = Depends(get_db)):
 
 
 @app.get("/tasks")
-async def list_tasks(db: Session = Depends(get_db)):
-    """获取所有任务"""
-    tasks = db.query(VideoTask).order_by(VideoTask.created_at.desc()).all()
-    return [task.to_dict() for task in tasks]
+async def list_tasks(
+    page: int = 1,
+    page_size: int = 12,
+    db: Session = Depends(get_db),
+):
+    """
+    获取任务列表（分页）
+
+    为了向后兼容，page_size <= 0 时返回所有任务的扁平数组（旧行为）。
+    其他情况返回 { items, total, page, page_size, total_pages } 结构。
+    """
+    if page_size <= 0:
+        tasks = db.query(VideoTask).order_by(VideoTask.created_at.desc()).all()
+        return [task.to_dict() for task in tasks]
+
+    page = max(1, int(page))
+    page_size = min(int(page_size), 100)  # 上限 100 防止恶意大请求
+
+    total = db.query(VideoTask).count()
+    tasks = (
+        db.query(VideoTask)
+        .order_by(VideoTask.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    total_pages = (total + page_size - 1) // page_size if total else 0
+    return {
+        "items": [t.to_dict() for t in tasks],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+    }
 
 
 @app.get("/download/audio/{task_id}")
@@ -258,6 +407,68 @@ async def preview_transcript(task_id: str, db: Session = Depends(get_db)):
     })
 
 
+def _delete_task_files(task: VideoTask) -> None:
+    """删除任务关联的本地文件（忽略不存在的文件）。"""
+    for file_path in (task.video_path, task.audio_path, task.transcript_path, task.srt_path):
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                log("Delete", f"remove file failed {file_path}: {e}")
+
+
+@app.post("/tasks/batch-delete")
+async def batch_delete_tasks(
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    """
+    批量删除任务
+
+    Body: { "ids": ["uuid1", "uuid2", ...] }
+    返回每条记录的处理结果。
+    """
+    ids = payload.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(status_code=400, detail="ids 不能为空")
+
+    # 限制单次批量删除上限，避免误操作
+    if len(ids) > 200:
+        raise HTTPException(status_code=400, detail="单次最多删除 200 条")
+
+    # 一次性查出存在的任务，避免 N 次查询
+    tasks = db.query(VideoTask).filter(VideoTask.id.in_(ids)).all()
+    found_map = {t.id: t for t in tasks}
+
+    deleted: List[str] = []
+    not_found: List[str] = []
+    errors: List[dict] = []
+
+    for tid in ids:
+        task = found_map.get(tid)
+        if not task:
+            not_found.append(tid)
+            continue
+        try:
+            _delete_task_files(task)
+            db.delete(task)
+            deleted.append(tid)
+        except Exception as e:
+            errors.append({"id": tid, "error": str(e)})
+
+    db.commit()
+    log(
+        "Delete",
+        f"batch_delete deleted={len(deleted)} not_found={len(not_found)} errors={len(errors)}",
+    )
+    return {
+        "success": True,
+        "deleted": deleted,
+        "not_found": not_found,
+        "errors": errors,
+    }
+
+
 @app.delete("/tasks/{task_id}")
 async def delete_task(task_id: str, db: Session = Depends(get_db)):
     """删除任务及相关文件"""
@@ -267,30 +478,10 @@ async def delete_task(task_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="任务不存在")
 
     try:
-        # 删除文件
-        files_to_delete = [
-            task.video_path,
-            task.audio_path,
-            task.transcript_path,
-            task.srt_path
-        ]
-
-        for file_path in files_to_delete:
-            if file_path and os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except Exception as e:
-                    print(f"Error deleting file {file_path}: {e}")
-
-        # 删除数据库记录
+        _delete_task_files(task)
         db.delete(task)
         db.commit()
-
-        return JSONResponse({
-            "success": True,
-            "message": "任务删除成功"
-        })
-
+        return JSONResponse({"success": True, "message": "任务删除成功"})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

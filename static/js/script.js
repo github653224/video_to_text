@@ -8,6 +8,12 @@ let tasks = [];
 let wsConnections = {};
 let refreshInterval = null;
 
+// 分页 + 选择
+let currentPage = 1;
+let pageSize = 12;
+let totalTasks = 0;
+const selectedTaskIds = new Set();
+
 // DOM元素引用
 let uploadArea, videoFileInput, uploadButton, taskList, refreshButton;
 let previewModal, previewAudio, previewText, downloadAudioBtn, downloadTextBtn;
@@ -138,68 +144,71 @@ function updateUploadAreaWithFiles() {
     `;
 }
 
-// 上传文件
+// 上传文件（分片上传，支持大文件）
 async function uploadFile() {
     if (selectedFiles.length === 0) {
         showAlert('warning', '请先选择文件');
         return;
     }
 
-    // 检查文件类型和大小
     const allowedTypes = ['video/mp4', 'video/avi', 'video/quicktime', 'video/x-matroska', 'video/webm', 'video/x-msvideo'];
-    const maxSize = 500 * 1024 * 1024; // 提升到 500MB
-    
     for (const file of selectedFiles) {
-        // 检查文件类型
         if (!allowedTypes.some(type => file.type === type || file.name.match(/\.(mp4|avi|mov|mkv|webm)$/i))) {
             showAlert('warning', `文件 ${file.name} 格式不支持，请选择视频文件`);
             return;
         }
-        
-        // 检查文件大小
-        if (file.size > maxSize) {
-            showAlert('danger', `文件 ${file.name} 太大，请选择小于 500MB 的文件`);
-            return;
-        }
     }
 
-    // 显示上传状态
     uploadButton.disabled = true;
     const originalButtonText = uploadButton.innerHTML;
-    uploadButton.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 上传中...';
 
     let successCount = 0;
     let failCount = 0;
 
-    // 逐个上传文件
     for (let i = 0; i < selectedFiles.length; i++) {
         const file = selectedFiles[i];
-        const formData = new FormData();
-        formData.append('file', file);
+        const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB per chunk
+        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+        const uploadId = crypto.randomUUID();
 
         try {
-            uploadButton.innerHTML = `<span class="spinner-border spinner-border-sm"></span> 上传中 (${i + 1}/${selectedFiles.length})...`;
-            
-            const response = await fetch('/upload', {
-                method: 'POST',
-                body: formData
-            });
+            // 上传各分片
+            for (let ci = 0; ci < totalChunks; ci++) {
+                const pct = Math.round(((ci + 1) / totalChunks) * 100);
+                uploadButton.innerHTML = `<span class="spinner-border spinner-border-sm"></span> 上传中 (${i + 1}/${selectedFiles.length}) ${pct}%`;
 
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => ({}));
-                throw new Error(errorData.detail || `上传失败: ${response.status}`);
+                const blob = file.slice(ci * CHUNK_SIZE, (ci + 1) * CHUNK_SIZE);
+                const fd = new FormData();
+                fd.append('file', blob, file.name);
+                fd.append('upload_id', uploadId);
+                fd.append('chunk_index', ci);
+                fd.append('total_chunks', totalChunks);
+                fd.append('filename', file.name);
+
+                const res = await fetch('/upload/chunk', { method: 'POST', body: fd });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    throw new Error(err.detail || `分片 ${ci} 上传失败: ${res.status}`);
+                }
             }
 
-            const result = await response.json();
+            // 合并分片
+            uploadButton.innerHTML = `<span class="spinner-border spinner-border-sm"></span> 合并中 (${i + 1}/${selectedFiles.length})...`;
+            const mfd = new FormData();
+            mfd.append('upload_id', uploadId);
+            mfd.append('filename', file.name);
+            mfd.append('total_chunks', totalChunks);
 
+            const mres = await fetch('/upload/merge', { method: 'POST', body: mfd });
+            if (!mres.ok) {
+                const err = await mres.json().catch(() => ({}));
+                throw new Error(err.detail || `合并失败: ${mres.status}`);
+            }
+
+            const result = await mres.json();
             if (result.success) {
                 successCount++;
-                
-                // 立即连接WebSocket
                 connectWebSocket(result.task_id);
-                
-                // 不在这里添加任务卡片，等待 loadTasks 统一加载
-                // 这样可以避免重复
             } else {
                 throw new Error(result.message || '上传失败');
             }
@@ -211,15 +220,10 @@ async function uploadFile() {
         }
     }
 
-    // 显示结果
     if (successCount > 0) {
         showAlert('success', `成功上传 ${successCount} 个文件${failCount > 0 ? `，${failCount} 个失败` : ''}`);
         resetUploadArea();
-        
-        // 延迟加载任务列表，等待后端创建完成
-        setTimeout(async () => {
-            await loadTasks();
-        }, 500);
+        setTimeout(async () => { await loadTasks(); }, 500);
     }
 
     uploadButton.disabled = false;
@@ -239,7 +243,7 @@ function resetUploadArea() {
                 </div>
                 <div class="flex-grow-1">
                     <h6 class="mb-1">点击或拖放视频文件</h6>
-                    <small class="text-muted">支持 MP4, AVI, MOV, MKV | 最大 500MB | 可多选</small>
+                    <small class="text-muted">支持 MP4, AVI, MOV, MKV | 可多选</small>
                 </div>
             </div>
         `;
@@ -288,29 +292,41 @@ function updateOrAddTask(taskData) {
     }
 }
 
-// 加载任务列表
+// 加载任务列表（分页）
 async function loadTasks() {
-    console.log('🔄 loadTasks called');
-    
-    // 只有当refreshButton存在时才更新其状态
+    console.log('🔄 loadTasks called', { currentPage, pageSize });
+
     if (refreshButton) {
         refreshButton.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 加载中...';
         refreshButton.disabled = true;
     }
 
     try {
-        const response = await fetch('/tasks');
-        
+        const response = await fetch(`/tasks?page=${currentPage}&page_size=${pageSize}`);
+
         if (response.ok) {
             const data = await response.json();
-            console.log(`📋 Tasks loaded: ${data.length} tasks`);
-            
-            // 直接替换任务列表，避免重复
-            tasks = data;
-            
+            // 兼容老接口（直接返回数组）
+            if (Array.isArray(data)) {
+                tasks = data;
+                totalTasks = data.length;
+            } else {
+                tasks = data.items || [];
+                totalTasks = data.total || 0;
+                currentPage = data.page || currentPage;
+                pageSize = data.page_size || pageSize;
+            }
+            console.log(`📋 Tasks loaded: ${tasks.length} of ${totalTasks}`);
+
+            // 清理已经不在当前页的选择
+            const currentIds = new Set(tasks.map(t => t.id));
+            for (const id of Array.from(selectedTaskIds)) {
+                if (!currentIds.has(id)) selectedTaskIds.delete(id);
+            }
+
             renderTaskList();
-            
-            // 加载完成后，重新评估刷新频率
+            renderPagination();
+            renderBulkBar();
             startSmartRefresh();
         } else {
             const errorText = await response.text();
@@ -321,7 +337,6 @@ async function loadTasks() {
         console.error('❌ 加载任务失败:', error);
         showAlert('danger', `加载任务列表失败: ${error.message}`);
     } finally {
-        // 无论如何都要重置刷新按钮状态（如果存在）
         if (refreshButton) {
             refreshButton.disabled = false;
             refreshButton.innerHTML = '<i class="bi bi-arrow-clockwise"></i> 刷新';
@@ -331,41 +346,29 @@ async function loadTasks() {
 
 // 渲染任务列表
 function renderTaskList() {
-    console.log('renderTaskList called');
-    console.log('taskList:', taskList);
-    console.log('tasks:', tasks);
-    console.log('tasks.length:', tasks ? tasks.length : 'undefined');
-    
-    if (!taskList) {
-        console.error('taskList is null');
-        return;
-    }
+    if (!taskList) return;
 
     try {
         if (!tasks || tasks.length === 0) {
-        console.log('No tasks to display');
-        taskList.innerHTML = `
-            <div class="col-12">
-                <div class="empty-state">
-                    <i class="bi bi-inbox"></i>
-                    <p>暂无转换任务，请上传视频文件开始使用</p>
+            taskList.innerHTML = `
+                <div class="col-12">
+                    <div class="empty-state">
+                        <i class="bi bi-inbox"></i>
+                        <p>暂无转换任务，请上传视频文件开始使用</p>
+                    </div>
                 </div>
-            </div>
-        `;
-        return;
-    }
+            `;
+            return;
+        }
 
-    console.log('Creating task cards');
-    const tasksHtml = tasks.map(task => createTaskCard(task)).join('');
-    console.log('tasksHtml length:', tasksHtml.length);
-    taskList.innerHTML = tasksHtml;
-    console.log('Task list updated');
+        const tasksHtml = tasks.map(task => createTaskCard(task)).join('');
+        taskList.innerHTML = tasksHtml;
 
-    // 为每个任务卡片添加动画
-    document.querySelectorAll('.task-card').forEach((card, index) => {
-        card.style.animationDelay = `${index * 0.1}s`;
-        card.classList.add('task-animation');
-    });
+        // 为每个任务卡片添加动画
+        document.querySelectorAll('.task-card').forEach((card, index) => {
+            card.style.animationDelay = `${index * 0.1}s`;
+            card.classList.add('task-animation');
+        });
     } catch (error) {
         console.error('Error rendering task list:', error);
         showAlert('danger', `渲染任务列表失败: ${error.message}`);
@@ -374,14 +377,21 @@ function renderTaskList() {
 
 // 创建任务卡片HTML
 function createTaskCard(task) {
+    const checked = selectedTaskIds.has(task.id) ? 'checked' : '';
     return `
         <div class="col-md-6 col-lg-4 mb-3">
             <div class="card task-card h-100">
                 <div class="card-body d-flex flex-column">
-                    <h6 class="card-title text-truncate" title="${task.original_filename}">
-                        <i class="bi bi-file-earmark-play"></i> ${escapeHtml(task.original_filename)}
-                    </h6>
-                    
+                    <div class="d-flex align-items-start mb-2">
+                        <input type="checkbox" class="form-check-input me-2 mt-1"
+                            ${checked}
+                            onchange="window.toggleTaskSelection('${task.id}', this.checked)"
+                            aria-label="选择任务">
+                        <h6 class="card-title text-truncate mb-0 flex-grow-1" title="${task.original_filename}">
+                            <i class="bi bi-file-earmark-play"></i> ${escapeHtml(task.original_filename)}
+                        </h6>
+                    </div>
+
                     <div class="mb-3">
                         <span class="badge ${getStatusBadgeClass(task.status)} status-badge">
                             ${getStatusText(task.status)}
@@ -390,38 +400,38 @@ function createTaskCard(task) {
                             ${formatTime(task.created_at)}
                         </small>
                     </div>
-                    
+
                     <div class="mb-3">
                         <div class="d-flex justify-content-between mb-1">
                             <small>转换进度</small>
                             <small>${task.progress}%</small>
                         </div>
                         <div class="progress">
-                            <div class="progress-bar ${getProgressBarClass(task.status)}" 
+                            <div class="progress-bar ${getProgressBarClass(task.status)}"
                                  style="width: ${task.progress}%">
                             </div>
                         </div>
                     </div>
-                    
+
                     ${task.error_message ? `
                         <div class="alert alert-danger alert-sm mb-3">
                             <small><i class="bi bi-exclamation-triangle"></i> ${escapeHtml(task.error_message)}</small>
                         </div>
                     ` : ''}
-                    
+
                     <div class="mt-auto d-grid gap-2">
                         ${task.status === 'completed' ? `
                             <button class="btn btn-success btn-sm" onclick="window.previewTask('${task.id}')">
                                 <i class="bi bi-eye"></i> 预览结果
                             </button>
                         ` : ''}
-                        
+
                         ${task.audio_url ? `
                             <a href="${task.audio_url}" class="btn btn-primary btn-sm" download>
                                 <i class="bi bi-music-note"></i> 下载音频
                             </a>
                         ` : ''}
-                        
+
                         ${task.transcript_url ? `
                             <a href="${task.transcript_url}" class="btn btn-primary btn-sm" download>
                                 <i class="bi bi-file-text"></i> 下载文字
@@ -433,7 +443,7 @@ function createTaskCard(task) {
                                 <i class="bi bi-file-earmark-text"></i> 下载SRT字幕
                             </a>
                         ` : ''}
-                        
+
                         <button class="btn btn-outline-danger btn-sm" onclick="window.deleteTask('${task.id}')">
                             <i class="bi bi-trash"></i> 删除
                         </button>
@@ -758,3 +768,106 @@ window.addEventListener('beforeunload', function() {
 // 导出到全局作用域
 window.resetUploadArea = resetUploadArea;
 window.loadTasks = loadTasks;
+
+// ====== 分页 & 批量删除 ======
+
+// 批量操作工具栏
+function renderBulkBar() {
+    const container = document.getElementById('bulkActions');
+    if (!container) return;
+    const selectedCount = selectedTaskIds.size;
+    const allCurrentSelected = tasks.length > 0 && tasks.every(t => selectedTaskIds.has(t.id));
+    container.innerHTML = `
+        <div class="d-flex flex-wrap align-items-center gap-2">
+            <button class="btn btn-sm btn-outline-primary" onclick="window.toggleSelectAllCurrent()">
+                <i class="bi ${allCurrentSelected ? 'bi-check-square-fill' : 'bi-square'}"></i>
+                ${allCurrentSelected ? '取消全选' : '全选本页'}
+            </button>
+            <button class="btn btn-sm btn-outline-secondary" onclick="window.clearSelection()" ${selectedCount === 0 ? 'disabled' : ''}>
+                清空选择
+            </button>
+            <button class="btn btn-sm btn-danger" onclick="window.batchDeleteSelected()" ${selectedCount === 0 ? 'disabled' : ''}>
+                <i class="bi bi-trash"></i> 删除选中 (${selectedCount})
+            </button>
+            <span class="text-muted small ms-auto">共 ${totalTasks} 个任务</span>
+        </div>
+    `;
+}
+
+// 分页栏
+function renderPagination() {
+    const container = document.getElementById('paginationControls');
+    if (!container) return;
+    const totalPages = Math.max(1, Math.ceil(totalTasks / pageSize));
+    if (totalPages <= 1) { container.innerHTML = ''; return; }
+    container.innerHTML = `
+        <nav class="d-flex justify-content-center mt-3" aria-label="分页导航">
+            <ul class="pagination pagination-sm mb-0">
+                <li class="page-item ${currentPage <= 1 ? 'disabled' : ''}">
+                    <a class="page-link" href="#" onclick="event.preventDefault(); window.goToPage(${currentPage - 1})">上一页</a>
+                </li>
+                <li class="page-item disabled">
+                    <span class="page-link">${currentPage} / ${totalPages}</span>
+                </li>
+                <li class="page-item ${currentPage >= totalPages ? 'disabled' : ''}">
+                    <a class="page-link" href="#" onclick="event.preventDefault(); window.goToPage(${currentPage + 1})">下一页</a>
+                </li>
+            </ul>
+        </nav>
+    `;
+}
+
+window.goToPage = function(page) {
+    const totalPages = Math.max(1, Math.ceil(totalTasks / pageSize));
+    currentPage = Math.min(Math.max(1, page), totalPages);
+    loadTasks();
+};
+
+window.toggleTaskSelection = function(taskId, checked) {
+    if (checked) selectedTaskIds.add(taskId);
+    else selectedTaskIds.delete(taskId);
+    renderBulkBar();
+};
+
+window.toggleSelectAllCurrent = function() {
+    const allCurrentSelected = tasks.length > 0 && tasks.every(t => selectedTaskIds.has(t.id));
+    if (allCurrentSelected) tasks.forEach(t => selectedTaskIds.delete(t.id));
+    else tasks.forEach(t => selectedTaskIds.add(t.id));
+    renderTaskList();
+    renderBulkBar();
+};
+
+window.clearSelection = function() {
+    selectedTaskIds.clear();
+    renderTaskList();
+    renderBulkBar();
+};
+
+window.batchDeleteSelected = async function() {
+    const ids = Array.from(selectedTaskIds);
+    if (ids.length === 0) return;
+    if (!confirm(`确定要删除选中的 ${ids.length} 个任务吗？相关文件也会被删除。`)) return;
+
+    try {
+        const response = await fetch('/tasks/batch-delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids })
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.detail || '批量删除失败');
+
+        ids.forEach(id => {
+            if (wsConnections[id]) {
+                wsConnections[id].close();
+                delete wsConnections[id];
+            }
+            selectedTaskIds.delete(id);
+        });
+        showAlert('success', `已删除 ${result.deleted?.length || 0} 个任务`);
+        await loadTasks();
+    } catch (error) {
+        console.error('批量删除失败:', error);
+        showAlert('danger', `批量删除失败: ${error.message}`);
+    }
+};

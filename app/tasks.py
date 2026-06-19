@@ -1,4 +1,5 @@
 import os
+import time
 from pathlib import Path
 from app.transcribe import get_transcriber
 from app.database import SessionLocal
@@ -6,6 +7,14 @@ from app.models import VideoTask
 from datetime import datetime
 import json
 import asyncio
+
+
+def _ts() -> str:
+    return time.strftime("%H:%M:%S", time.localtime()) + f".{int((time.time() % 1) * 1000):03d}"
+
+
+def log(tag: str, msg: str) -> None:
+    print(f"[{_ts()}] [{tag}] {msg}", flush=True)
 
 
 class TranscriptionTask:
@@ -32,7 +41,7 @@ class TranscriptionTask:
             self.task.status = status
         self.task.progress = progress
         self.db.commit()
-        print(f"[Task {self.task_id}] Progress: {progress}%, Status: {status or self.task.status}")
+        log("Task", f"{self.task_id[:8]} progress={progress}% status={status or self.task.status}")
 
         # 同时广播进度更新
         await self.broadcast_progress()
@@ -49,55 +58,77 @@ class TranscriptionTask:
                     "status": self.task.status,
                     "task_data": task_data
                 })
-                
+
+                bt0 = time.time()
+                conns = list(self.websocket_manager.active_connections)
                 # 直接使用异步方式发送消息给每个连接
-                for connection in self.websocket_manager.active_connections:
+                for connection in conns:
                     try:
                         await connection.send_text(message)
                     except Exception as e:
-                        print(f"Error sending message to connection: {e}")
+                        log("Task", f"{self.task_id[:8]} ws send failed: {e}")
+                cost = time.time() - bt0
+                if cost > 0.5:
+                    log("Task", f"{self.task_id[:8]} broadcast slow cost={cost:.2f}s conns={len(conns)}")
             except Exception as e:
-                print(f"Error broadcasting progress for task {self.task_id}: {e}")
+                log("Task", f"{self.task_id[:8]} broadcast error: {e}")
 
     async def process(self):
         """处理视频转录任务"""
+        t_start = time.time()
         try:
-            print(f"[Task {self.task_id}] Starting processing...")
+            log("Task", f"{self.task_id[:8]} === process() begin ===")
 
             # 更新状态为处理中
             await self.update_progress(0, "processing")
 
-            # 1. 文件路径
-            video_path = self.video_dir / f"{self.task_id}.mp4"
+            # 1. 文件路径 —— 使用数据库里保存的真实路径，避免写死 .mp4
+            if self.task and self.task.video_path:
+                video_path = Path(self.task.video_path)
+            else:
+                # 兜底：在 video_dir 下按 task_id 通配
+                candidates = list(self.video_dir.glob(f"{self.task_id}.*"))
+                if not candidates:
+                    raise FileNotFoundError(
+                        f"Video file not found for task {self.task_id} (db.video_path empty, no glob match)"
+                    )
+                video_path = candidates[0]
+
+            log("Task", f"{self.task_id[:8]} video_path={video_path}")
 
             if not video_path.exists():
                 raise FileNotFoundError(f"Video file not found: {video_path}")
 
             # 验证文件大小
             file_size = video_path.stat().st_size
-            print(f"[Task {self.task_id}] Video file size: {file_size / (1024*1024):.2f} MB")
+            log("Task", f"{self.task_id[:8]} file_size={file_size / (1024 * 1024):.2f} MB")
 
             # 2. 提取音频（用于下载）
             audio_path = self.audio_dir / f"{self.task_id}.mp3"
             await self.update_progress(5, "extracting_audio")
 
+            log("Task", f"{self.task_id[:8]} loading transcriber instance ...")
+            t_get = time.time()
             transcriber_instance = get_transcriber()
-            
+            log("Task", f"{self.task_id[:8]} transcriber ready cost={time.time() - t_get:.2f}s")
+
             # 在线程池中运行音频提取
             loop = asyncio.get_event_loop()
             try:
+                t_audio = time.time()
+                log("Task", f"{self.task_id[:8]} extract_audio start")
                 duration = await loop.run_in_executor(
                     None,
                     transcriber_instance.extract_audio,
                     str(video_path),
                     str(audio_path)
                 )
+                log("Task", f"{self.task_id[:8]} extract_audio done duration={duration:.2f}s cost={time.time() - t_audio:.2f}s")
                 self.task.duration = duration
                 self.task.audio_path = str(audio_path)
                 self.db.commit()
-                print(f"[Task {self.task_id}] Audio extracted: {duration:.2f}s, saved to {audio_path}")
             except Exception as e:
-                print(f"[Task {self.task_id}] Audio extraction failed: {e}")
+                log("Task", f"{self.task_id[:8]} extract_audio FAILED: {e}")
                 # 音频提取失败不影响转录，继续处理
                 # 但不设置 audio_path，这样前端就不会显示下载按钮
 
@@ -115,7 +146,8 @@ class TranscriptionTask:
                 )
 
             # 在线程池中运行转录任务
-            print(f"[Task {self.task_id}] Starting transcription...")
+            t_trans = time.time()
+            log("Task", f"{self.task_id[:8]} transcribe start (run_in_executor)")
             result = await loop.run_in_executor(
                 None,
                 lambda: transcriber_instance.transcribe_with_progress(
@@ -125,16 +157,17 @@ class TranscriptionTask:
                     progress_callback=sync_progress_callback
                 )
             )
-
-            print(f"[Task {self.task_id}] Transcription completed")
+            log("Task", f"{self.task_id[:8]} transcribe done cost={time.time() - t_trans:.2f}s text_len={len(result.get('text', ''))}")
 
             # 4. 保存转录结果
             await self.update_progress(95, "saving_results")
+            t_save = time.time()
             txt_path, srt_path, json_path = transcriber_instance.save_transcript(
                 result,
                 str(self.transcript_dir),
                 self.task_id
             )
+            log("Task", f"{self.task_id[:8]} save_transcript done cost={time.time() - t_save:.2f}s")
 
             # 5. 更新数据库
             self.task.transcript_path = txt_path
@@ -145,20 +178,20 @@ class TranscriptionTask:
             self.task.completed_at = datetime.utcnow()
             self.db.commit()
 
-            print(f"[Task {self.task_id}] Processing completed successfully")
+            log("Task", f"{self.task_id[:8]} === process() done total_cost={time.time() - t_start:.2f}s ===")
 
         except Exception as e:
-            print(f"[Task {self.task_id}] Processing failed: {e}")
+            log("Task", f"{self.task_id[:8]} process FAILED after {time.time() - t_start:.2f}s: {e}")
             import traceback
             traceback.print_exc()
-            
+
             self.task.status = "failed"
             self.task.error_message = str(e)
             self.db.commit()
-            
+
             # 广播失败状态
             await self.broadcast_progress()
             raise
-            
+
         finally:
             self.db.close()
