@@ -17,6 +17,11 @@ def log(tag: str, msg: str) -> None:
     print(f"[{_ts()}] [{tag}] {msg}", flush=True)
 
 
+# 转录并发信号量：限制同时进行转录的任务数，避免多任务争抢模型/内存
+MAX_CONCURRENT_TRANSCRIPTIONS = int(os.getenv("MAX_CONCURRENT_TRANSCRIPTIONS", "1"))
+_transcription_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TRANSCRIPTIONS)
+
+
 class TranscriptionTask:
     def __init__(self, task_id, websocket_manager=None):
         self.task_id = task_id
@@ -132,32 +137,31 @@ class TranscriptionTask:
                 # 音频提取失败不影响转录，继续处理
                 # 但不设置 audio_path，这样前端就不会显示下载按钮
 
-            # 3. 转录视频
-            await self.update_progress(10, "transcribing")
+            # 3. 转录视频（通过信号量排队，避免多任务同时占用模型）
+            log("Task", f"{self.task_id[:8]} waiting for transcription slot (max={MAX_CONCURRENT_TRANSCRIPTIONS})...")
+            await self.update_progress(10, "queued")
 
-            # 创建一个同步的进度回调包装器
-            def sync_progress_callback(progress):
-                # 将0-100的进度映射到10-95的范围
-                mapped_progress = 10 + (progress * 0.85)
-                # 在事件循环中调度异步更新
-                asyncio.run_coroutine_threadsafe(
-                    self.update_progress(int(mapped_progress)),
-                    loop
-                )
+            async with _transcription_semaphore:
+                await self.update_progress(10, "transcribing")
 
-            # 在线程池中运行转录任务
-            t_trans = time.time()
-            log("Task", f"{self.task_id[:8]} transcribe start (run_in_executor)")
-            result = await loop.run_in_executor(
-                None,
-                lambda: transcriber_instance.transcribe_with_progress(
-                    str(video_path),
-                    language="zh",
-                    task="transcribe",
-                    progress_callback=sync_progress_callback
+                def sync_progress_callback(progress):
+                    mapped_progress = 10 + (progress * 0.85)
+                    asyncio.run_coroutine_threadsafe(
+                        self.update_progress(int(mapped_progress)),
+                        loop
+                    )
+
+                t_trans = time.time()
+                log("Task", f"{self.task_id[:8]} transcribe start (run_in_executor)")
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: transcriber_instance.transcribe_with_progress(
+                        str(video_path),
+                        task="transcribe",
+                        progress_callback=sync_progress_callback
+                    )
                 )
-            )
-            log("Task", f"{self.task_id[:8]} transcribe done cost={time.time() - t_trans:.2f}s text_len={len(result.get('text', ''))}")
+                log("Task", f"{self.task_id[:8]} transcribe done cost={time.time() - t_trans:.2f}s text_len={len(result.get('text', ''))}")
 
             # 4. 保存转录结果
             await self.update_progress(95, "saving_results")
