@@ -258,11 +258,12 @@ function startSmartRefresh() {
     }
     
     // 检查是否有进行中的任务
-    const hasActiveTasks = tasks.some(task => 
-        task.status === 'pending' || 
-        task.status === 'processing' || 
-        task.status === 'extracting_audio' || 
-        task.status === 'transcribing' || 
+    const hasActiveTasks = tasks.some(task =>
+        task.status === 'pending' ||
+        task.status === 'processing' ||
+        task.status === 'extracting_audio' ||
+        task.status === 'queued' ||
+        task.status === 'transcribing' ||
         task.status === 'saving_results'
     );
     
@@ -672,6 +673,7 @@ function getStatusText(status) {
         'pending': '等待中',
         'processing': '处理中',
         'extracting_audio': '提取音频',
+        'queued': '排队等待转录',
         'transcribing': '转录音频',
         'saving_results': '保存结果',
         'completed': '已完成',
@@ -685,6 +687,7 @@ function getStatusBadgeClass(status) {
         'pending': 'bg-secondary',
         'processing': 'bg-primary',
         'extracting_audio': 'bg-info',
+        'queued': 'bg-secondary',
         'transcribing': 'bg-warning',
         'saving_results': 'bg-info',
         'completed': 'bg-success',
@@ -698,6 +701,7 @@ function getProgressBarClass(status) {
         'pending': 'bg-secondary',
         'processing': 'progress-bar-animated progress-bar-striped bg-primary',
         'extracting_audio': 'progress-bar-animated progress-bar-striped bg-info',
+        'queued': 'progress-bar-animated progress-bar-striped bg-secondary',
         'transcribing': 'progress-bar-animated progress-bar-striped bg-warning',
         'saving_results': 'progress-bar-animated progress-bar-striped bg-info',
         'completed': 'bg-success',

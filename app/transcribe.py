@@ -21,15 +21,36 @@ warnings.filterwarnings("ignore")
 _model_lock = threading.Lock()
 
 
+def _env_int(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "base")
+WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "zh")
+WHISPER_BEAM_SIZE = _env_int("WHISPER_BEAM_SIZE", 1)
+WHISPER_BEST_OF = _env_int("WHISPER_BEST_OF", 1)
+WHISPER_FP16 = _env_bool("WHISPER_FP16", False)
+
+
 class VideoTranscriber:
-    def __init__(self, model_size="base"):
+    def __init__(self, model_size=None):
         """
         初始化转录器
 
         Args:
-            model_size: 模型大小 (tiny, base, small, medium, large)
+            model_size: 模型大小 (tiny, base, small, medium, large)，默认读取 WHISPER_MODEL_SIZE
         """
-        self.model_size = model_size
+        self.model_size = model_size or WHISPER_MODEL_SIZE
         self.model = None
         self._load_model()
 
@@ -50,7 +71,7 @@ class VideoTranscriber:
         """
         try:
             print(f"[FFmpeg] Extracting audio from {video_path}")
-            
+
             # 使用 FFmpeg 提取音频为 MP3 格式（用于下载）
             cmd = [
                 "ffmpeg", "-i", video_path,
@@ -62,10 +83,10 @@ class VideoTranscriber:
                 audio_path,
                 "-y"  # 覆盖输出文件
             ]
-            
+
             result = subprocess.run(
-                cmd, 
-                capture_output=True, 
+                cmd,
+                capture_output=True,
                 text=True,
                 check=True
             )
@@ -76,17 +97,17 @@ class VideoTranscriber:
                 "format=duration", "-of", "csv=p=0", video_path
             ]
             duration_result = subprocess.run(
-                cmd_duration, 
-                capture_output=True, 
-                text=True, 
+                cmd_duration,
+                capture_output=True,
+                text=True,
                 check=True
             )
             duration = float(duration_result.stdout.strip())
-            
+
             # 验证音频文件是否成功创建
             if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
                 raise RuntimeError("Audio extraction failed: output file is empty")
-            
+
             print(f"[FFmpeg] Audio extracted successfully: {duration:.2f} seconds")
             return duration
 
@@ -116,15 +137,20 @@ class VideoTranscriber:
                 progress_callback(0)
 
             # 转录参数
+            selected_language = language or WHISPER_LANGUAGE
             options = {
                 "task": task,
-                "language": language,
+                "language": selected_language,
                 "verbose": False,
-                "fp16": False,
-                "beam_size": 5,  # 提高准确率
-                "best_of": 5,
+                "fp16": WHISPER_FP16,
+                "beam_size": WHISPER_BEAM_SIZE,
+                "best_of": WHISPER_BEST_OF,
                 "temperature": 0.0,  # 使用贪婪解码，更稳定
             }
+            print(
+                f"[Whisper] Options: model={self.model_size}, language={selected_language}, "
+                f"beam_size={WHISPER_BEAM_SIZE}, best_of={WHISPER_BEST_OF}, fp16={WHISPER_FP16}"
+            )
 
             # 改进的进度更新（更平滑，不会卡在某个百分比）
             progress_value = [10]
@@ -135,24 +161,24 @@ class VideoTranscriber:
                 """智能进度更新 - 根据时间动态调整"""
                 import time
                 start_time[0] = time.time()
-                
+
                 while not stop_progress[0]:
                     elapsed = time.time() - start_time[0]
-                    
+
                     # 根据经过的时间动态计算进度
                     # 假设平均每秒处理 1% 的进度
                     estimated_progress = 10 + min(int(elapsed / 2), 85)
-                    
+
                     # 使用缓慢增长的曲线，避免卡在某个值
                     if progress_value[0] < estimated_progress:
                         progress_value[0] = estimated_progress
                     else:
                         # 即使估算进度没增加，也缓慢增长
                         progress_value[0] = min(progress_value[0] + 1, 95)
-                    
+
                     if progress_callback:
                         progress_callback(progress_value[0])
-                    
+
                     time.sleep(3)  # 每3秒更新一次
 
             # 启动进度更新线程
@@ -220,7 +246,7 @@ class VideoTranscriber:
 
             print(f"[Save] Transcript saved: {txt_path}")
             return txt_path, srt_path, json_path
-            
+
         except Exception as e:
             print(f"[Save] Error saving transcript: {e}")
             raise
@@ -260,8 +286,8 @@ def get_transcriber():
     所有任务共享同一个模型实例，但使用线程锁确保安全
     """
     global _global_transcriber
-    
+
     with _transcriber_lock:
         if _global_transcriber is None:
-            _global_transcriber = VideoTranscriber(model_size="base")
+            _global_transcriber = VideoTranscriber()
         return _global_transcriber
