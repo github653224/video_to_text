@@ -630,9 +630,9 @@ function connectWebSocket(taskId) {
                     renderTaskList();
                 }
 
-                // 如果任务完成，关闭WebSocket连接
-                if (data.status === 'completed' || data.status === 'failed') {
-                    console.log(`🏁 Task ${taskId} completed/failed, scheduling WebSocket close`);
+                // 如果任务结束，关闭WebSocket连接
+                if (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled') {
+                    console.log(`🏁 Task ${taskId} completed/failed/cancelled, scheduling WebSocket close`);
                     setTimeout(() => {
                         if (wsConnections[taskId]) {
                             console.log(`🔌 Closing WebSocket for task ${taskId}`);
