@@ -142,6 +142,11 @@ class TranscriptionTask:
             await self.update_progress(10, "queued")
 
             async with _transcription_semaphore:
+                self.db.refresh(self.task)
+                if self.task.status == "cancelled":
+                    log("Task", f"{self.task_id[:8]} cancelled before transcription start")
+                    return
+
                 await self.update_progress(10, "transcribing")
 
                 def sync_progress_callback(progress):
