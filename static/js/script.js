@@ -630,8 +630,8 @@ function connectWebSocket(taskId) {
                     renderTaskList();
                 }
 
-                // 如果任务结束，关闭WebSocket连接
-                if (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled') {
+                // 如果任务结束，关闭WebSocket连接（必须确认 task_id 匹配，避免广播误杀其他任务的连接）
+                if (data.task_id === taskId && (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled')) {
                     console.log(`🏁 Task ${taskId} completed/failed/cancelled, scheduling WebSocket close`);
                     setTimeout(() => {
                         if (wsConnections[taskId]) {
