@@ -31,7 +31,32 @@ app = FastAPI(
     version="1.0.0"
 )
 
+
+def mark_interrupted_tasks() -> int:
+    """服务启动时，把上次运行中断的活跃任务标记为失败，避免永远卡住。"""
+    db = next(get_db())
+    try:
+        interrupted = db.query(VideoTask).filter(VideoTask.status.in_(ACTIVE_TASK_STATUSES)).all()
+        for task in interrupted:
+            task.status = "failed"
+            task.error_message = "服务重启导致任务中断，请重新上传处理"
+        db.commit()
+        return len(interrupted)
+    finally:
+        db.close()
+
+
 # 初始化数据库
+
+# 任务状态集合
+ACTIVE_TASK_STATUSES = {"pending", "processing", "extracting_audio", "queued", "transcribing", "saving_results"}
+CANCELLABLE_TASK_STATUSES = {"pending", "queued"}
+DELETABLE_TASK_STATUSES = {"completed", "failed", "cancelled"}
+
+
+def is_active_task(status: str) -> bool:
+    return status in ACTIVE_TASK_STATUSES
+
 init_db()
 
 # 配置静态文件和模板
@@ -100,14 +125,14 @@ async def upload_video(
         # 保存视频文件 - 使用任务ID作为文件名，避免同名冲突
         video_dir = UPLOAD_DIR / "videos"
         video_dir.mkdir(exist_ok=True)
-        
+
         # 获取原始文件扩展名
         file_ext = Path(file.filename).suffix or '.mp4'
         video_path = video_dir / f"{task_id}{file_ext}"
 
         # 流式保存大文件，避免内存溢出
         print(f"[Upload] Saving file: {file.filename} -> {video_path.name}")
-        
+
         with open(video_path, "wb") as buffer:
             # 分块读取，每次1MB
             chunk_size = 1024 * 1024
@@ -450,6 +475,9 @@ async def batch_delete_tasks(
             not_found.append(tid)
             continue
         try:
+            if is_active_task(task.status):
+                errors.append({"id": tid, "error": f"任务正在运行（{task.status}），请先取消或等待完成"})
+                continue
             _delete_task_files(task)
             db.delete(task)
             deleted.append(tid)
@@ -469,6 +497,32 @@ async def batch_delete_tasks(
     }
 
 
+@app.post("/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str, db: Session = Depends(get_db)):
+    """取消尚未进入转录执行阶段的任务（pending/queued）。"""
+    task = db.query(VideoTask).filter(VideoTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    if task.status not in CANCELLABLE_TASK_STATUSES:
+        raise HTTPException(status_code=409, detail=f"当前状态（{task.status}）不支持取消")
+
+    task.status = "cancelled"
+    task.progress = 0
+    task.error_message = "用户取消任务"
+    db.commit()
+
+    await manager.broadcast(json.dumps({
+        "type": "progress_update",
+        "task_id": task_id,
+        "progress": task.progress,
+        "status": task.status,
+        "task_data": task.to_dict(),
+    }))
+
+    return JSONResponse({"success": True, "message": "任务已取消"})
+
+
 @app.delete("/tasks/{task_id}")
 async def delete_task(task_id: str, db: Session = Depends(get_db)):
     """删除任务及相关文件"""
@@ -478,10 +532,14 @@ async def delete_task(task_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="任务不存在")
 
     try:
+        if is_active_task(task.status):
+            raise HTTPException(status_code=409, detail=f"任务正在运行（{task.status}），请先取消或等待完成")
         _delete_task_files(task)
         db.delete(task)
         db.commit()
         return JSONResponse({"success": True, "message": "任务删除成功"})
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -534,10 +592,13 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
 @app.on_event("startup")
 async def startup_event():
     """应用启动时执行"""
+    interrupted_count = mark_interrupted_tasks()
     print("=" * 50)
     print("🎬 Video to Text Converter Started!")
     print(f"📁 Upload directory: {UPLOAD_DIR.absolute()}")
     print(f"🌐 Server: http://localhost:8000")
+    if interrupted_count:
+        print(f"⚠️ 已将 {interrupted_count} 个上次中断的任务标记为失败")
     print("=" * 50)
 
 

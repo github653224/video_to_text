@@ -127,8 +127,8 @@ function updateUploadAreaWithFiles() {
     if (!uploadArea || selectedFiles.length === 0) return;
 
     const totalSize = selectedFiles.reduce((sum, file) => sum + file.size, 0);
-    const fileNames = selectedFiles.length === 1 
-        ? selectedFiles[0].name 
+    const fileNames = selectedFiles.length === 1
+        ? selectedFiles[0].name
         : `${selectedFiles.length} 个文件`;
 
     uploadArea.innerHTML = `
@@ -256,7 +256,7 @@ function startSmartRefresh() {
     if (refreshInterval) {
         clearInterval(refreshInterval);
     }
-    
+
     // 检查是否有进行中的任务
     const hasActiveTasks = tasks.some(task =>
         task.status === 'pending' ||
@@ -266,7 +266,7 @@ function startSmartRefresh() {
         task.status === 'transcribing' ||
         task.status === 'saving_results'
     );
-    
+
     if (hasActiveTasks) {
         // 有进行中的任务，每5秒刷新一次
         refreshInterval = setInterval(loadTasks, 5000);
@@ -281,7 +281,7 @@ function startSmartRefresh() {
 // 更新或添加任务到列表（避免重复）
 function updateOrAddTask(taskData) {
     const taskIndex = tasks.findIndex(t => t.id === taskData.id);
-    
+
     if (taskIndex !== -1) {
         // 任务已存在，更新它
         tasks[taskIndex] = { ...tasks[taskIndex], ...taskData };
@@ -445,6 +445,12 @@ function createTaskCard(task) {
                             </a>
                         ` : ''}
 
+                        ${['pending', 'queued'].includes(task.status) ? `
+                            <button class="btn btn-outline-warning btn-sm" onclick="window.cancelTask('${task.id}')">
+                                <i class="bi bi-x-circle"></i> 取消任务
+                            </button>
+                        ` : ''}
+
                         <button class="btn btn-outline-danger btn-sm" onclick="window.deleteTask('${task.id}')">
                             <i class="bi bi-trash"></i> 删除
                         </button>
@@ -473,7 +479,7 @@ window.previewTask = async function(taskId) {
 
         // 获取任务信息
         const task = tasks.find(t => t.id === taskId);
-        
+
         // 设置音频预览
         if (previewAudio) {
             if (task && task.audio_url) {
@@ -552,6 +558,23 @@ window.deleteTask = async function(taskId) {
     }
 };
 
+// 取消任务（仅 pending/queued）
+window.cancelTask = async function(taskId) {
+    if (!confirm('确定要取消这个任务吗？')) return;
+
+    try {
+        const response = await fetch(`/tasks/${taskId}/cancel`, { method: 'POST' });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.detail || '取消失败');
+        showAlert('success', '任务已取消');
+        await loadTasks();
+    } catch (error) {
+        console.error('取消失败:', error);
+        showAlert('danger', `取消失败: ${error.message}`);
+    }
+};
+
+
 // 连接到WebSocket
 function connectWebSocket(taskId) {
     // 如果已经存在连接，先关闭
@@ -588,10 +611,10 @@ function connectWebSocket(taskId) {
                     console.log(`📊 Progress update received for task ${taskId}: ${data.progress}%`);
                     // 使用包含进度数据的任务信息更新
                     const taskData = data.task_data;
-                    
+
                     // 更新或添加任务到本地列表
                     updateOrAddTask(taskData);
-                    
+
                     // 重新渲染任务列表
                     console.log(`🎨 Calling renderTaskList()`);
                     renderTaskList();
@@ -599,17 +622,17 @@ function connectWebSocket(taskId) {
                 } else {
                     // 处理其他类型的消息（如状态更新）
                     console.log(`📝 Status update received for task ${taskId}: ${data.status}`);
-                    
+
                     // 更新或添加任务到本地列表
                     updateOrAddTask(data);
-                    
+
                     // 重新渲染任务列表
                     renderTaskList();
                 }
 
-                // 如果任务完成，关闭WebSocket连接
-                if (data.status === 'completed' || data.status === 'failed') {
-                    console.log(`🏁 Task ${taskId} completed/failed, scheduling WebSocket close`);
+                // 如果任务结束，关闭WebSocket连接（必须确认 task_id 匹配，避免广播误杀其他任务的连接）
+                if (data.task_id === taskId && (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled')) {
+                    console.log(`🏁 Task ${taskId} completed/failed/cancelled, scheduling WebSocket close`);
                     setTimeout(() => {
                         if (wsConnections[taskId]) {
                             console.log(`🔌 Closing WebSocket for task ${taskId}`);
@@ -677,6 +700,7 @@ function getStatusText(status) {
         'transcribing': '转录音频',
         'saving_results': '保存结果',
         'completed': '已完成',
+        'cancelled': '已取消',
         'failed': '失败'
     };
     return statusMap[status] || status;
@@ -691,6 +715,7 @@ function getStatusBadgeClass(status) {
         'transcribing': 'bg-warning',
         'saving_results': 'bg-info',
         'completed': 'bg-success',
+        'cancelled': 'bg-dark',
         'failed': 'bg-danger'
     };
     return classMap[status] || 'bg-secondary';
@@ -705,6 +730,7 @@ function getProgressBarClass(status) {
         'transcribing': 'progress-bar-animated progress-bar-striped bg-warning',
         'saving_results': 'progress-bar-animated progress-bar-striped bg-info',
         'completed': 'bg-success',
+        'cancelled': 'bg-dark',
         'failed': 'bg-danger'
     };
     return classMap[status] || 'bg-secondary';
